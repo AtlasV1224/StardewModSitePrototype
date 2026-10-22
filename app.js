@@ -90,6 +90,20 @@
     return '';
   }
 
+  // Downloads the README, the description file it may point to, and the manifest into the bundle
+  async function fillFiles(bundle) {
+    const base = { owner: bundle.owner, repo: bundle.repo, ref: bundle.ref };
+    bundle.readme = await fetchReadme(base, bundle.path);
+    let bodies = extractBlocks(bundle.readme).blocks;
+    const descLoc = locate(parseInfo(bodies).modDescription, base);
+    if (descLoc) {
+      bundle.descText = await fetchText(descLoc.raw);
+      if (bundle.descText) bodies = bodies.concat(extractBlocks(bundle.descText).blocks);
+    }
+    const manifestLoc = locate(parseInfo(bodies).manifest, base);
+    if (manifestLoc) bundle.manifestText = await fetchText(manifestLoc.raw);
+  }
+
   // Fallback for mods the Action has not processed yet: fetches everything with the REST API and caches it.
   async function fetchMod(target) {
     const cached = cacheGet(target.id);
@@ -114,8 +128,7 @@
       id: target.id, key: target.key, owner: target.owner, repo: target.repo,
       ref: base.ref, path: target.path,
       url: info.html_url, stars: info.stargazers_count, description: info.description || '',
-      readme: await fetchReadme(base, target.path),
-      descText: '', manifestText: '',
+      readme: '', descText: '', manifestText: '',
       releases: rels.filter((r) => !r.draft).map((r) => ({
         name: r.name || r.tag_name,
         tag: r.tag_name,
@@ -129,17 +142,7 @@
       })),
     };
 
-    // README can point at a separate description file
-    let bodies = extractBlocks(bundle.readme).blocks;
-    const descLoc = locate(parseInfo(bodies).modDescription, base);
-    if (descLoc) {
-      bundle.descText = await fetchText(descLoc.raw);
-      if (bundle.descText) bodies = bodies.concat(extractBlocks(bundle.descText).blocks);
-    }
-    // The manifest can be named in either document
-    const manifestLoc = locate(parseInfo(bodies).manifest, base);
-    if (manifestLoc) bundle.manifestText = await fetchText(manifestLoc.raw);
-
+    await fillFiles(bundle);
     cacheSet(target.id, bundle);
     return bundle;
   }
@@ -201,7 +204,10 @@
   async function loadDetail(mod) {
     const res = await fetch(`data/mods/${mod.file}`);
     if (!res.ok) throw new Error('Could not load this mod.');
-    Object.assign(mod, deriveMod(await res.json(), taxonomy), { detailLoaded: true });
+    const bundle = await res.json();
+    // The Action could not download the files (GitHub refused it), try from here instead
+    if (!bundle.readme && !bundle.descText) await fillFiles(bundle);
+    Object.assign(mod, deriveMod(bundle, taxonomy), { detailLoaded: true });
   }
 
   /* Dependencies */
