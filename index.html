@@ -10,10 +10,21 @@
 <body>
   <header class="site-header">
     <h1>Mods</h1>
-    <input id="search" type="search" placeholder="Search mods" aria-label="Search mods">
+    <div class="header-tools">
+      <button id="taglist-open" class="btn" type="button">Tag list</button>
+      <input id="search" type="search" placeholder="Search mods" aria-label="Search mods">
+    </div>
   </header>
 
   <main>
+    <details id="filters" class="filters" hidden>
+      <summary>Filters <span id="filter-count"></span></summary>
+      <div id="filter-body" class="filter-body"></div>
+      <div class="filter-actions">
+        <button id="filter-clear" class="btn" type="button">Clear filters</button>
+      </div>
+    </details>
+
     <p id="status" class="status" role="status"></p>
     <div id="grid" class="grid"></div>
   </main>
@@ -24,8 +35,24 @@
     <img alt="">
   </div>
 
+  <dialog id="taglist" class="dialog">
+    <div class="dialog-head">
+      <h2>Tag list</h2>
+      <button id="taglist-close" class="btn" type="button">Close</button>
+    </div>
+    <p>
+      Copy this into your mod's README or mod page. Put an x between the brackets of each tag
+      that applies and delete the rest. Unrecognised tags are ignored. For the other fields
+      (Manifest, Name, Dependancies, Optional Mods) see the
+      <a href="https://github.com/AtlasV1224/ExampleModForStardewModsite" target="_blank" rel="noopener noreferrer">example mod</a>.
+    </p>
+    <pre><code id="taglist-code"></code></pre>
+    <button id="taglist-copy" class="btn" type="button">Copy</button>
+  </dialog>
+
   <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
+
