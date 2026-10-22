@@ -1,0 +1,25 @@
+{
+  "categories": [
+    { "name": "Audio", "tags": ["Additions", "Mechanics"] },
+    { "name": "Buildings", "tags": ["Additions", "Mechanics", "Recolor"] },
+    { "name": "Characters", "tags": ["Additions", "Visual Modifications", "Content Modifications"] },
+    { "name": "Farmer Clothing", "tags": ["Additions", "Modifications"] },
+    { "name": "Crafting", "tags": ["Additions", "Modifications"] },
+    { "name": "Crops", "tags": ["Additions", "Modifications"] },
+    { "name": "Dialogue", "tags": ["Additions", "Modifications"] },
+    { "name": "Events", "tags": ["Additions", "Modifications"] },
+    { "name": "Collectables", "tags": ["Fish", "Museum Donations"] },
+    { "name": "Maps", "tags": ["Additions", "Modifications"] },
+    { "name": "Livestock", "tags": ["Additions", "Visual Modifications", "Content Modifications"] },
+    { "name": "Modding Tools", "tags": ["In Game", "External"] },
+    {
+      "name": "Translation",
+      "open": true,
+      "tags": [
+        "German", "Spanish", "French", "Italian", "Japanese", "Korean", "Hungarian", "Portuguese", "Russian", "Turkish", "Chinese",
+        "Other (Language without a language code)"
+      ]
+    }
+  ],
+  "standalone": ["Expansions", "Cheats"]
+}
