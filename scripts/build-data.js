@@ -25,7 +25,8 @@ const FULL_REFRESH = process.env.FULL_REFRESH === 'true';
 const RAW = 'https://raw.githubusercontent.com';
 const BATCH_SIZE = 25;       // repositories per GraphQL request
 const RELEASES = 5;          // releases kept per mod
-const FILE_CONCURRENCY = 8;  // simultaneous raw file downloads
+const FILE_CONCURRENCY = 4;  // simultaneous raw file downloads (kept low: raw.githubusercontent.com rate limits bursts)
+const BACKOFF_MS = Number(process.env.BACKOFF_MS || 2000);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -44,9 +45,13 @@ const REPO_FIELDS = `
     }
   }`;
 
+// One tree listing per mod folder: the exact file names, so README.MD or ReadMe.md are found too
+const treeAlias = (t, j) =>
+  `t${j}: object(expression: ${JSON.stringify((t.ref || 'HEAD') + ':' + t.path)}) { ... on Tree { entries { name type } } }`;
+
 function buildQuery(repos) {
   const body = repos.map((r, i) =>
-    `r${i}: repository(owner: ${JSON.stringify(r.owner)}, name: ${JSON.stringify(r.repo)}) {${REPO_FIELDS}\n}`);
+    `r${i}: repository(owner: ${JSON.stringify(r.owner)}, name: ${JSON.stringify(r.repo)}) {${REPO_FIELDS}\n${r.targets.map(treeAlias).join('\n')}\n}`);
   return `query {\n  rateLimit { cost remaining resetAt }\n${body.join('\n')}\n}`;
 }
 
@@ -80,25 +85,47 @@ async function runBatch(repos) {
 
 /* Raw files */
 
+// Returns the text, '' if the file does not exist, or null if GitHub kept refusing (rate limit, outage).
+// The difference matters: a missing file is final, a refused one must be retried on the next run.
 async function fetchText(url) {
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
       const res = await fetch(url, { headers: { 'User-Agent': 'stardew-modsite-data' } });
       if (res.ok) return await res.text();
       if (res.status === 404) return '';
-    } catch {}
-    await sleep(attempt * 1000);
+      const wait = Number(res.headers.get('retry-after'));
+      await sleep(Math.min(wait > 0 ? wait * 1000 : attempt * BACKOFF_MS, 30000));
+    } catch {
+      await sleep(attempt * BACKOFF_MS);
+    }
   }
-  return '';
+  return null;
 }
 
-async function fetchReadme(base, folder) {
+const README_EXT = ['md', 'markdown', 'mdown', 'mkd', 'txt', 'rst', 'adoc', 'org', ''];
+const README_GUESSES = ['README.md', 'readme.md', 'Readme.md', 'README.markdown', 'README'];
+
+// The README file names in a folder listing, best first
+function readmeNames(entries) {
+  return entries
+    .filter((e) => e.type === 'blob' && /^readme(\.[a-z]+)?$/i.test(e.name))
+    .map((e) => e.name)
+    .sort((a, b) => {
+      const rank = (n) => { const i = README_EXT.indexOf((n.split('.')[1] || '').toLowerCase()); return i < 0 ? 99 : i; };
+      return rank(a) - rank(b);
+    });
+}
+
+// { text, ok }: ok is false when a download failed, so the result is not trustworthy
+async function fetchReadme(base, folder, entries) {
   const prefix = folder ? folder + '/' : '';
-  for (const name of ['README.md', 'readme.md', 'Readme.md', 'README.markdown', 'README']) {
+  let ok = true;
+  for (const name of entries ? readmeNames(entries) : README_GUESSES) {
     const text = await fetchText(makeLoc(base.owner, base.repo, base.ref, prefix + name).raw);
-    if (text) return text;
+    if (text === null) ok = false;
+    else if (text) return { text, ok: true };
   }
-  return '';
+  return { text: '', ok };
 }
 
 async function pool(items, limit, fn) {
@@ -111,7 +138,7 @@ async function pool(items, limit, fn) {
 /* One mod */
 
 // The raw data for one mod. Releases are always fresh, the text files are reused from the previous run
-// when the repository has not been pushed to since (unless a file lives in another repository).
+// when the repository has not been pushed to since, but only if that run downloaded them all successfully.
 async function buildBundle(target, repo, prev) {
   const base = {
     owner: target.owner,
@@ -137,31 +164,49 @@ async function buildBundle(target, repo, prev) {
     id: target.id, key: target.key, owner: target.owner, repo: target.repo,
     ref: base.ref, path: target.path,
     url: repo.url, stars: repo.stargazerCount, description: repo.description || '',
-    pushedAt: repo.pushedAt, external: false,
+    pushedAt: repo.pushedAt, external: false, filesOk: true,
     readme: '', descText: '', manifestText: '',
     releases,
   };
 
-  if (!FULL_REFRESH && prev && prev.pushedAt && prev.pushedAt === repo.pushedAt
+  if (!FULL_REFRESH && prev && prev.filesOk && prev.pushedAt && prev.pushedAt === repo.pushedAt
       && prev.ref === base.ref && !prev.external) {
     Object.assign(bundle, { readme: prev.readme, descText: prev.descText, manifestText: prev.manifestText });
     return bundle;
   }
 
-  bundle.readme = await fetchReadme(base, target.path);
+  let ok = true;
+  const readme = await fetchReadme(base, target.path, (repo.trees || {})[target.id]);
+  bundle.readme = readme.text;
+  ok = ok && readme.ok;
 
   // README can point at a separate description file, and either file can name the manifest
   let bodies = extractBlocks(bundle.readme).blocks;
   const descLoc = locate(parseInfo(bodies).modDescription, base);
   if (descLoc) {
-    bundle.descText = await fetchText(descLoc.raw);
-    if (bundle.descText) bodies = bodies.concat(extractBlocks(bundle.descText).blocks);
+    const text = await fetchText(descLoc.raw);
+    if (text === null) ok = false;
+    else { bundle.descText = text; if (text) bodies = bodies.concat(extractBlocks(text).blocks); }
   }
   const manifestLoc = locate(parseInfo(bodies).manifest, base);
-  if (manifestLoc) bundle.manifestText = await fetchText(manifestLoc.raw);
+  if (manifestLoc) {
+    const text = await fetchText(manifestLoc.raw);
+    if (text === null) ok = false; else bundle.manifestText = text;
+  }
 
   const own = `${RAW}/${target.owner}/${target.repo}/`.toLowerCase();
   bundle.external = [descLoc, manifestLoc].some((l) => l && !l.raw.toLowerCase().startsWith(own));
+
+  if (!ok) {
+    // Do not let a failed download wipe out good data, and make sure the next run tries again
+    bundle.filesOk = false;
+    if (prev && prev.readme) {
+      Object.assign(bundle, { readme: prev.readme, descText: prev.descText, manifestText: prev.manifestText });
+      console.warn(`Could not refresh files for ${target.key}; kept the previous ones, will retry next run`);
+    } else {
+      console.warn(`Could not download all files for ${target.key}; will retry next run`);
+    }
+  }
   return bundle;
 }
 
@@ -217,7 +262,10 @@ async function main() {
   }
   const repoKey = (t) => `${t.owner}/${t.repo}`.toLowerCase();
   const repos = new Map();
-  for (const t of targets.values()) if (!repos.has(repoKey(t))) repos.set(repoKey(t), { owner: t.owner, repo: t.repo });
+  for (const t of targets.values()) {
+    if (!repos.has(repoKey(t))) repos.set(repoKey(t), { owner: t.owner, repo: t.repo, targets: [] });
+    repos.get(repoKey(t)).targets.push(t);
+  }
   console.log(`${targets.size} mods in ${repos.size} repositories${FULL_REFRESH ? ' (full refresh)' : ''}`);
 
   // Repo info and releases, in batches
@@ -228,8 +276,11 @@ async function main() {
     const data = await runBatch(batch.map(([, r]) => r));
     if (!data) continue;
     batch.forEach(([key, r], n) => {
-      if (data[`r${n}`]) repoData.set(key, data[`r${n}`]);
-      else console.warn(`Repository not found: ${r.owner}/${r.repo}`);
+      const found = data[`r${n}`];
+      if (!found) return console.warn(`Repository not found: ${r.owner}/${r.repo}`);
+      found.trees = {};
+      r.targets.forEach((t, j) => { found.trees[t.id] = found[`t${j}`] ? found[`t${j}`].entries : null; });
+      repoData.set(key, found);
     });
   }
 
