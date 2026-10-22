@@ -4,12 +4,20 @@ on:
   schedule:
     - cron: '17 * * * *'     # every hour
   workflow_dispatch:         # run it by hand from the Actions tab
+    inputs:
+      full_refresh:
+        description: Re-download every README and manifest instead of reusing unchanged ones
+        type: boolean
+        default: false
   push:
-    paths:
-      - mods.json            # refresh straight away when the list changes
+    paths:                   # refresh straight away when the list, tags or build code change
+      - mods.json
+      - tags.json
+      - parser.js
+      - scripts/build-data.js
 
 permissions:
-  contents: write            # commit data/mods.json
+  contents: write            # commit the data folder
   pages: write               # ask Pages to rebuild after the commit
 
 concurrency:
@@ -30,6 +38,7 @@ jobs:
         run: node scripts/build-data.js
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FULL_REFRESH: ${{ inputs.full_refresh }}
 
       - name: Commit changes
         run: |
