@@ -16,7 +16,7 @@
   const best = new Map();            // dependency identity -> best known {label, href}
   const filters = { tags: new Set(), packs: new Set(), requires: new Set() };
   let taxonomy = { categories: [], standalone: [] };
-  let prebuilt = {};                 // data/mods.json written by the Action: id -> fetched mod data
+  const indexed = new Map();         // id -> card data from data/index.json (written by the Action)
   let ready = false;
 
   function el(tag, props = {}, ...children) {
@@ -30,23 +30,10 @@
     return node;
   }
 
-  const { parseRef, makeLoc, locate, parseLooseJson, ci, extractBlocks, parseInfo, norm, short } = ModsiteParser;
+  const { parseRef, makeLoc, locate, extractBlocks, parseInfo, short, resolveImage, deriveMod } = ModsiteParser;
 
   /* Tags */
 
-
-  // Turns a ticked line into a known tag id ("Crops/Additions", "Cheats") or null if unrecognised
-  function canonTag(category, label) {
-    const l = norm(label);
-    const standalone = (taxonomy.standalone || []).find((x) => norm(x) === l);
-    if (standalone) return standalone;
-    const cat = (taxonomy.categories || []).find((c) => norm(c.name) === norm(category));
-    if (!cat) return null;
-    const known = cat.tags.find((x) => norm(x) === l);
-    if (known) return `${cat.name}/${short(known)}`;
-    if (cat.open && !/[<>]/.test(label)) return `${cat.name}/${label.trim()}`;
-    return null;
-  }
 
   function tagLabel(id) {
     const i = id.indexOf('/');
@@ -103,10 +90,8 @@
     return '';
   }
 
-  // Fallback when the Action has not produced data for this mod: fetches it with the REST API and caches it.
-  // buildMod() derives the display data from the result, same as for prebuilt data.
+  // Fallback for mods the Action has not processed yet: fetches everything with the REST API and caches it.
   async function fetchMod(target) {
-    if (prebuilt[target.id]) return prebuilt[target.id];   // no API calls needed
     const cached = cacheGet(target.id);
     if (cached) return cached;
 
@@ -161,41 +146,24 @@
 
   /* Building a mod from fetched data */
 
-  const BADGE = /shields\.io|badgen|badge|travis-ci|codecov|coveralls|img\.buymeacoffee/i;
-
-  function resolveImage(src, loc) {
-    if (!src || src.startsWith('data:')) return src;
-    let href;
-    try {
-      href = src.startsWith('/') && !src.startsWith('//') ? loc.rootRaw + src.slice(1) : new URL(src, loc.dirRaw).href;
-    } catch { return src; }
-    return href.replace(
-      /^https:\/\/github\.com\/([^/]+\/[^/]+)\/(?:blob|raw)\//,
-      'https://raw.githubusercontent.com/$1/'
-    );
-  }
-
   function resolveLink(href, loc) {
     try {
       return href.startsWith('/') && !href.startsWith('//') ? loc.rootBlob + href.slice(1) : new URL(href, loc.dirBlob).href;
     } catch { return href; }
   }
 
-  // Returns { fragment, images } for markdown located at loc
+  // Returns a sanitised fragment for markdown located at loc, with images and links made absolute
   function renderMarkdown(md, loc) {
     const html = DOMPurify.sanitize(marked.parse(md || '', { gfm: true }));
     const tpl = document.createElement('template');
     tpl.innerHTML = html;
     const root = tpl.content;
-    const images = [];
 
     root.querySelectorAll('source').forEach((s) => s.remove());
     root.querySelectorAll('img').forEach((img) => {
-      const src = resolveImage(img.getAttribute('src') || '', loc);
-      img.setAttribute('src', src);
+      img.setAttribute('src', resolveImage(img.getAttribute('src') || '', loc));
       img.removeAttribute('srcset');
       img.setAttribute('loading', 'lazy');
-      if (src && !BADGE.test(src) && !images.includes(src)) images.push(src);
     });
     root.querySelectorAll('a[href]').forEach((a) => {
       const href = a.getAttribute('href');
@@ -204,67 +172,36 @@
       a.setAttribute('target', '_blank');
       a.setAttribute('rel', 'noopener noreferrer');
     });
-    return { fragment: root, images };
+    return root;
   }
 
-  function buildMod(b) {
-    const base = { owner: b.owner, repo: b.repo, ref: b.ref };
-    const readmeLoc = makeLoc(b.owner, b.repo, b.ref, (b.path ? b.path + '/' : '') + 'README.md');
+  /* Building a mod */
 
-    // Description: the README, or the file it redirects to
-    const rm = extractBlocks(b.readme);
-    let md = rm.text, loc = readmeLoc, bodies = rm.blocks;
-    if (b.descText) {
-      const descLoc = locate(parseInfo(rm.blocks).modDescription, base);
-      if (descLoc) {
-        const dm = extractBlocks(b.descText);
-        md = dm.text; loc = descLoc; bodies = rm.blocks.concat(dm.blocks);
-      }
-    }
-    const info = parseInfo(bodies);
-
-    let manifest = null;
-    if (b.manifestText) { try { manifest = parseLooseJson(b.manifestText); } catch {} }
-    const ov = info.overrides;
-    const mf = (k) => { const v = ci(manifest, k); return typeof v === 'string' ? v : ''; };
-
-    const latest = b.releases[0];
-    const packRaw = ci(manifest, 'ContentPackFor');
-    const mod = {
-      id: b.id,
-      key: b.key,
-      owner: b.owner,
-      repo: b.repo,
-      path: b.path,
-      url: b.path ? `${b.url}/tree/${b.ref}/${b.path}` : b.url,
-      repoUrl: b.url,
-      stars: b.stars,
-      releases: b.releases,
-      rootLoc: makeLoc(b.owner, b.repo, b.ref, 'README.md'),
-      descMd: md,
-      descLoc: loc,
-      name: ov.name || mf('Name') || (b.path ? b.path.split('/').pop() : b.repo),
-      author: ov.author || mf('Author') || b.owner,
-      version: ov.version || mf('Version') || (latest ? latest.tag : ''),
-      summary: ov.description || mf('Description') || (b.path ? '' : b.description),   // a shared repo's description is not this mod's
-      uniqueId: ov.uniqueid || mf('UniqueID'),
-      packFor: ov.contentpackfor || (typeof packRaw === 'string' ? packRaw : (ci(packRaw, 'UniqueID') || '')),
-      manifestDeps: (Array.isArray(ci(manifest, 'Dependencies')) ? ci(manifest, 'Dependencies') : [])
-        .filter((d) => ci(d, 'UniqueID'))
-        .map((d) => ({ ref: ci(d, 'UniqueID'), required: ci(d, 'IsRequired') !== false })),
-      blockDeps: info.deps,
-      pairs: info.optional,
-      tagIds: new Set(info.tags.map((t) => canonTag(t.category, t.label)).filter(Boolean)),
-    };
-
-    const { images } = renderMarkdown(md, loc);
-    const releaseImages = latest
-      ? latest.assets.filter((a) => (a.type || '').startsWith('image/')).map((a) => a.url)
-      : [];
-    mod.images = [...images, ...releaseImages.filter((u) => !images.includes(u))];
-    mod.thumb = mod.images[0] || `https://opengraph.githubassets.com/1/${b.owner}/${b.repo}`;
+  function finish(mod) {
     mod.search = [mod.name, mod.author, mod.summary, ...[...mod.tagIds].map(tagLabel)].join(' ').toLowerCase();
     return mod;
+  }
+
+  // From raw fetched data (REST fallback): everything is available straight away
+  function buildMod(bundle) {
+    return finish({ ...deriveMod(bundle, taxonomy), detailLoaded: true });
+  }
+
+  // From an entry in data/index.json: only what cards and filters need, the page loads when opened
+  function fromIndex(entry) {
+    return finish({
+      ...entry,
+      tagIds: new Set(entry.tags),
+      rootLoc: makeLoc(entry.owner, entry.repo, entry.ref, 'README.md'),
+      detailLoaded: false,
+    });
+  }
+
+  // Downloads data/mods/<file> and fills in the description, images and releases
+  async function loadDetail(mod) {
+    const res = await fetch(`data/mods/${mod.file}`);
+    if (!res.ok) throw new Error('Could not load this mod.');
+    Object.assign(mod, deriveMod(await res.json(), taxonomy), { detailLoaded: true });
   }
 
   /* Dependencies */
@@ -490,7 +427,7 @@
     }
     if (rel.body.trim()) {
       const notes = el('div', { class: 'notes markdown' });
-      notes.append(renderMarkdown(rel.body, mod.rootLoc).fragment);
+      notes.append(renderMarkdown(rel.body, mod.rootLoc));
       block.append(el('details', {}, el('summary', { text: 'Release notes' }), notes));
     }
     return block;
@@ -533,15 +470,25 @@
     return side;
   }
 
-  function openDetail(mod) {
-    detail.replaceChildren();
-
+  function detailBar(mod) {
     const back = el('button', { class: 'btn', type: 'button', text: 'Back' });
     back.addEventListener('click', () => { location.hash = ''; });
-    detail.append(el('div', { class: 'detail-bar' },
+    return el('div', { class: 'detail-bar' },
       back,
       el('div', { class: 'title', text: mod.name }),
-      el('a', { class: 'btn', href: mod.url, target: '_blank', rel: 'noopener', text: 'View on GitHub' })));
+      el('a', { class: 'btn', href: mod.url, target: '_blank', rel: 'noopener', text: 'View on GitHub' }));
+  }
+
+  function showDetailMessage(mod, message) {
+    detail.replaceChildren(detailBar(mod),
+      el('div', { class: 'detail-scroll' }, el('div', { class: 'detail-inner' }, el('p', { class: 'muted', text: message }))));
+    detail.hidden = false;
+    document.body.classList.add('locked');
+    document.title = `${mod.name} - Mods`;
+  }
+
+  function openDetail(mod) {
+    detail.replaceChildren(detailBar(mod));
 
     const inner = el('div', { class: 'detail-inner' });
 
@@ -557,7 +504,7 @@
     }
 
     const readme = el('article', { class: 'markdown' });
-    if (mod.descMd.trim()) readme.append(renderMarkdown(mod.descMd, mod.descLoc).fragment);
+    if (mod.descMd.trim()) readme.append(renderMarkdown(mod.descMd, mod.descLoc));
     else readme.append(el('p', { text: 'This mod has no description.' }));
 
     inner.append(el('div', { class: 'layout' }, readme, sidebar(mod)));
@@ -587,13 +534,21 @@
     else if (!detail.hidden) location.hash = '';
   });
 
-  /*  Routing */
+  /* Routing */
 
-  function route() {
-    const id = decodeURIComponent(location.hash.slice(1)).toLowerCase();
+  const currentId = () => decodeURIComponent(location.hash.slice(1)).toLowerCase();
+
+  async function route() {
+    const id = currentId();
     const mod = mods.get(id);
-    if (mod) openDetail(mod);
-    else closeDetail();
+    if (!mod) return closeDetail();
+    if (!mod.detailLoaded) {
+      showDetailMessage(mod, 'Loading…');
+      try { await loadDetail(mod); }
+      catch (err) { if (currentId() === id) showDetailMessage(mod, err.message || 'Could not load this mod.'); return; }
+      if (currentId() !== id) return;          // the person moved on while it loaded
+    }
+    openDetail(mod);
   }
   window.addEventListener('hashchange', route);
 
@@ -605,13 +560,13 @@
       const [listRes, tagRes, dataRes] = await Promise.all([
         fetch(LIST_URL),
         fetch('tags.json').catch(() => null),
-        fetch('data/mods.json').catch(() => null),
+        fetch('data/index.json').catch(() => null),
       ]);
       if (!listRes.ok) throw new Error();
       list = await listRes.json();
       if (!Array.isArray(list)) throw new Error();
       if (tagRes && tagRes.ok) taxonomy = await tagRes.json();
-      if (dataRes && dataRes.ok) { try { prebuilt = (await dataRes.json()).mods || {}; } catch {} }
+      if (dataRes && dataRes.ok) { try { ((await dataRes.json()).mods || []).forEach((e) => indexed.set(e.id, e)); } catch {} }
     } catch {
       statusEl.textContent = `Could not load ${LIST_URL}. It should be a JSON array of GitHub URLs.`;
       return;
@@ -629,7 +584,8 @@
       grid.append(card);
       if (!target) return errorCard(card, String(url), 'Not a recognised GitHub URL.');
       try {
-        const mod = buildMod(await fetchMod(target));
+        const entry = indexed.get(target.id);
+        const mod = entry ? fromIndex(entry) : buildMod(await fetchMod(target));
         mods.set(mod.id, mod);
         fillCard(card, mod);
         applyFilters();
