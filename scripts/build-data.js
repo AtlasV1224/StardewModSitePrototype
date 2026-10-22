@@ -1,19 +1,28 @@
 #!/usr/bin/env node
-// Fetches the data for every mod in mods.json and writes it to data/mods.json.
+// Fetches the data for every mod in mods.json and writes it to the data folder:
+//   data/index.json        one small entry per mod, enough for the cards, search and filters
+//   data/mods/<file>.json  everything for one mod (README, releases, ...), loaded when it is opened
 // Repo info and releases come from the GraphQL API (many repos per request), README, description
-// and manifest files come from raw.githubusercontent.com, which is not API rate limited i think.
+// and manifest files come from raw.githubusercontent.com, which is not API rate limited.
 // Needs a token in GITHUB_TOKEN. Run by .github/workflows/update-data.yml.
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
-const { parseRef, makeLoc, locate, extractBlocks, parseInfo } = require('../parser.js');
+const crypto = require('crypto');
+const { parseRef, makeLoc, locate, extractBlocks, parseInfo, deriveMod } = require('../parser.js');
 
 const ROOT = path.join(__dirname, '..');
 const LIST_FILE = path.join(ROOT, 'mods.json');
-const OUT_FILE = path.join(ROOT, 'data', 'mods.json');
+const TAGS_FILE = path.join(ROOT, 'tags.json');
+const DATA_DIR = path.join(ROOT, 'data');
+const MODS_DIR = path.join(DATA_DIR, 'mods');
+const INDEX_FILE = path.join(DATA_DIR, 'index.json');
+
 const API = process.env.GRAPHQL_URL || 'https://api.github.com/graphql';
 const TOKEN = process.env.GITHUB_TOKEN;
+const FULL_REFRESH = process.env.FULL_REFRESH === 'true';
+const RAW = 'https://raw.githubusercontent.com';
 const BATCH_SIZE = 25;       // repositories per GraphQL request
 const RELEASES = 5;          // releases kept per mod
 const FILE_CONCURRENCY = 8;  // simultaneous raw file downloads
@@ -26,6 +35,7 @@ const REPO_FIELDS = `
   description
   url
   stargazerCount
+  pushedAt
   defaultBranchRef { name }
   releases(first: ${RELEASES}, orderBy: { field: CREATED_AT, direction: DESC }) {
     nodes {
@@ -100,8 +110,9 @@ async function pool(items, limit, fn) {
 
 /* One mod */
 
-// Same shape the site's REST fallback produces, so the site can use either
-async function buildBundle(target, repo) {
+// The raw data for one mod. Releases are always fresh, the text files are reused from the previous run
+// when the repository has not been pushed to since (unless a file lives in another repository).
+async function buildBundle(target, repo, prev) {
   const base = {
     owner: target.owner,
     repo: target.repo,
@@ -126,10 +137,18 @@ async function buildBundle(target, repo) {
     id: target.id, key: target.key, owner: target.owner, repo: target.repo,
     ref: base.ref, path: target.path,
     url: repo.url, stars: repo.stargazerCount, description: repo.description || '',
-    readme: await fetchReadme(base, target.path),
-    descText: '', manifestText: '',
+    pushedAt: repo.pushedAt, external: false,
+    readme: '', descText: '', manifestText: '',
     releases,
   };
+
+  if (!FULL_REFRESH && prev && prev.pushedAt && prev.pushedAt === repo.pushedAt
+      && prev.ref === base.ref && !prev.external) {
+    Object.assign(bundle, { readme: prev.readme, descText: prev.descText, manifestText: prev.manifestText });
+    return bundle;
+  }
+
+  bundle.readme = await fetchReadme(base, target.path);
 
   // README can point at a separate description file, and either file can name the manifest
   let bodies = extractBlocks(bundle.readme).blocks;
@@ -140,7 +159,37 @@ async function buildBundle(target, repo) {
   }
   const manifestLoc = locate(parseInfo(bodies).manifest, base);
   if (manifestLoc) bundle.manifestText = await fetchText(manifestLoc.raw);
+
+  const own = `${RAW}/${target.owner}/${target.repo}/`.toLowerCase();
+  bundle.external = [descLoc, manifestLoc].some((l) => l && !l.raw.toLowerCase().startsWith(own));
   return bundle;
+}
+
+/* Output */
+
+// A readable, collision-free file name for a mod id
+function fileName(id) {
+  const slug = id.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+  return `${slug}-${crypto.createHash('sha1').update(id).digest('hex').slice(0, 8)}.json`;
+}
+
+// What the cards, search and filters need, and nothing more
+function indexEntry(bundle, file, taxonomy) {
+  const m = deriveMod(bundle, taxonomy);
+  return {
+    id: m.id, key: m.key, owner: m.owner, repo: m.repo, ref: m.ref, path: m.path,
+    url: m.url, repoUrl: m.repoUrl, stars: m.stars,
+    name: m.name, author: m.author, version: m.version, summary: m.summary,
+    uniqueId: m.uniqueId, packFor: m.packFor,
+    manifestDeps: m.manifestDeps, blockDeps: m.blockDeps, pairs: m.pairs,
+    tags: [...m.tagIds].sort(),
+    thumb: m.thumb,
+    file,
+  };
+}
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
 /* Main */
@@ -150,9 +199,13 @@ async function main() {
 
   const list = JSON.parse(fs.readFileSync(LIST_FILE, 'utf8'));
   if (!Array.isArray(list)) throw new Error('mods.json must be an array of URLs');
+  const taxonomy = readJson(TAGS_FILE) || { categories: [], standalone: [] };
 
-  let previous = {};
-  try { previous = JSON.parse(fs.readFileSync(OUT_FILE, 'utf8')).mods || {}; } catch {}
+  // Last run's data, used for unchanged repos and as a fallback when GitHub fails
+  const prevIndex = readJson(INDEX_FILE);
+  const prevEntries = (prevIndex && prevIndex.mods) || [];
+  const prevFile = new Map(prevEntries.map((e) => [e.id, e.file]));
+  const readPrev = (id) => (prevFile.has(id) ? readJson(path.join(MODS_DIR, prevFile.get(id))) : null);
 
   // Mods to fetch, de-duplicated, and the unique repositories they live in
   const targets = new Map();
@@ -165,7 +218,7 @@ async function main() {
   const repoKey = (t) => `${t.owner}/${t.repo}`.toLowerCase();
   const repos = new Map();
   for (const t of targets.values()) if (!repos.has(repoKey(t))) repos.set(repoKey(t), { owner: t.owner, repo: t.repo });
-  console.log(`${targets.size} mods in ${repos.size} repositories`);
+  console.log(`${targets.size} mods in ${repos.size} repositories${FULL_REFRESH ? ' (full refresh)' : ''}`);
 
   // Repo info and releases, in batches
   const repoData = new Map();
@@ -180,31 +233,52 @@ async function main() {
     });
   }
 
-  // README, description and manifest files, then assemble the output
-  const mods = {};
+  // README, description and manifest files
+  const bundles = new Map();
   await pool([...targets.values()], FILE_CONCURRENCY, async (t) => {
+    const prev = readPrev(t.id);
     const repo = repoData.get(repoKey(t));
     if (!repo) {
-      if (previous[t.id]) { mods[t.id] = previous[t.id]; console.warn(`Kept previous data for ${t.key}`); }
+      if (prev) { bundles.set(t.id, prev); console.warn(`Kept previous data for ${t.key}`); }
       return;
     }
-    try { mods[t.id] = await buildBundle(t, repo); }
+    try { bundles.set(t.id, await buildBundle(t, repo, prev)); }
     catch (err) {
       console.warn(`Failed to build ${t.key}: ${err.message}`);
-      if (previous[t.id]) mods[t.id] = previous[t.id];
+      if (prev) bundles.set(t.id, prev);
     }
   });
 
-  // Only rewrite the file when something changed, so the repo is not committed to every run
-  const ids = Object.keys(mods).sort();
-  const sorted = Object.fromEntries(ids.map((id) => [id, mods[id]]));
-  if (JSON.stringify(sorted) === JSON.stringify(previous)) { console.log('No changes.'); return; }
+  // One file per mod, rewritten only when its content changed
+  const ids = [...bundles.keys()].sort();
+  fs.mkdirSync(MODS_DIR, { recursive: true });
+  let written = 0;
+  const entries = [];
+  for (const id of ids) {
+    const file = fileName(id);
+    const text = JSON.stringify(bundles.get(id)) + '\n';
+    const target = path.join(MODS_DIR, file);
+    let old = '';
+    try { old = fs.readFileSync(target, 'utf8'); } catch {}
+    if (old !== text) { fs.writeFileSync(target, text); written++; }
+    entries.push(indexEntry(bundles.get(id), file, taxonomy));
+  }
 
-  const lines = ids.map((id) => `${JSON.stringify(id)}: ${JSON.stringify(mods[id])}`);
-  fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
-  fs.writeFileSync(OUT_FILE,
-    `{\n"generated": ${JSON.stringify(new Date().toISOString())},\n"mods": {\n${lines.join(',\n')}\n}\n}\n`);
-  console.log(`Wrote ${ids.length} mods to data/mods.json`);
+  // Remove files for mods that are no longer in the list, and the old single-file format
+  const keep = new Set(entries.map((e) => e.file));
+  let removed = 0;
+  for (const f of fs.readdirSync(MODS_DIR)) {
+    if (f.endsWith('.json') && !keep.has(f)) { fs.rmSync(path.join(MODS_DIR, f)); removed++; }
+  }
+  fs.rmSync(path.join(DATA_DIR, 'mods.json'), { force: true });
+
+  // The index is rewritten only when an entry changed, so `generated` does not cause a commit by itself
+  let indexChanged = !prevIndex || JSON.stringify(prevEntries) !== JSON.stringify(entries);
+  if (indexChanged) {
+    fs.writeFileSync(INDEX_FILE,
+      `{"generated":${JSON.stringify(new Date().toISOString())},"mods":[\n${entries.map((e) => JSON.stringify(e)).join(',\n')}\n]}\n`);
+  }
+  console.log(`${entries.length} mods: ${written} files written, ${removed} removed, index ${indexChanged ? 'updated' : 'unchanged'}.`);
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
