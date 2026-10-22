@@ -1,0 +1,45 @@
+name: Update mod data
+
+on:
+  schedule:
+    - cron: '17 * * * *'     # every hour
+  workflow_dispatch:         # run it by hand from the Actions tab
+  push:
+    paths:
+      - mods.json            # refresh straight away when the list changes
+
+permissions:
+  contents: write            # commit data/mods.json
+  pages: write               # ask Pages to rebuild after the commit
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch mod data
+        run: node scripts/build-data.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit changes
+        run: |
+          if [ -n "$(git status --porcelain data)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data
+            git commit -m "Update mod data"
+            git push
+            gh api -X POST "repos/${{ github.repository }}/pages/builds" || true
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
