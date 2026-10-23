@@ -27,6 +27,8 @@ const BATCH_SIZE = 25;       // repositories per GraphQL request
 const RELEASES = 5;          // releases kept per mod
 const FILE_CONCURRENCY = 4;  // simultaneous raw file downloads (kept low: raw.githubusercontent.com rate limits bursts)
 const BACKOFF_MS = Number(process.env.BACKOFF_MS || 2000);
+// Bump this when the way files are found or stored changes: older saved files are then downloaded again once
+const BUNDLE_VERSION = 2;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -104,6 +106,8 @@ async function fetchText(url) {
 
 const README_EXT = ['md', 'markdown', 'mdown', 'mkd', 'txt', 'rst', 'adoc', 'org', ''];
 const README_GUESSES = ['README.md', 'readme.md', 'Readme.md', 'README.markdown', 'README'];
+// GitHub also shows a README kept in these folders when the root has none (for whole-repo mods only)
+const README_FOLDERS = ['docs/README.md', 'docs/readme.md', '.github/README.md'];
 
 // The README file names in a folder listing, best first
 function readmeNames(entries) {
@@ -116,16 +120,52 @@ function readmeNames(entries) {
     });
 }
 
-// { text, ok }: ok is false when a download failed, so the result is not trustworthy
+// GitHub's own README lookup: it also checks .github/ and docs/ and accepts any name or extension.
+// Returns { text, path }, with text '' when there is none, or null if GitHub kept refusing.
+async function fetchReadmeViaApi(base, folder) {
+  const dir = folder ? '/' + folder.split('/').map(encodeURIComponent).join('/') : '';
+  const ref = base.ref && base.ref !== 'HEAD' ? `?ref=${encodeURIComponent(base.ref)}` : '';
+  const url = `https://api.github.com/repos/${base.owner}/${base.repo}/readme${dir}${ref}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'stardew-modsite-data' },
+      });
+      if (res.status === 404) return { text: '', path: '' };
+      if (res.ok) {
+        const j = await res.json();
+        let text = j.encoding === 'base64' && j.content ? Buffer.from(j.content, 'base64').toString('utf8') : '';
+        if (!text && j.download_url) text = (await fetchText(j.download_url)) || '';
+        return { text, path: j.path || '' };
+      }
+    } catch {}
+    await sleep(attempt * BACKOFF_MS);
+  }
+  return null;
+}
+
+// { text, path, ok }: path is where the README was found, ok is false when a download failed,
+// so the result is not trustworthy
 async function fetchReadme(base, folder, entries) {
   const prefix = folder ? folder + '/' : '';
   let ok = true;
   for (const name of entries ? readmeNames(entries) : README_GUESSES) {
     const text = await fetchText(makeLoc(base.owner, base.repo, base.ref, prefix + name).raw);
     if (text === null) ok = false;
-    else if (text) return { text, ok: true };
+    else if (text) return { text, path: prefix + name, ok: true };
   }
-  return { text: '', ok };
+  if (!folder) {
+    for (const path of README_FOLDERS) {
+      const text = await fetchText(makeLoc(base.owner, base.repo, base.ref, path).raw);
+      if (text === null) ok = false;
+      else if (text) return { text, path, ok: true };
+    }
+  }
+  // Still nothing: ask GitHub, which finds it wherever it is
+  const found = await fetchReadmeViaApi(base, folder);
+  if (found === null) ok = false;
+  else if (found.text) return { ...found, ok: true };
+  return { text: '', path: '', ok };
 }
 
 async function pool(items, limit, fn) {
@@ -164,20 +204,21 @@ async function buildBundle(target, repo, prev) {
     id: target.id, key: target.key, owner: target.owner, repo: target.repo,
     ref: base.ref, path: target.path,
     url: repo.url, stars: repo.stargazerCount, description: repo.description || '',
-    pushedAt: repo.pushedAt, external: false, filesOk: true,
-    readme: '', descText: '', manifestText: '',
+    v: BUNDLE_VERSION, pushedAt: repo.pushedAt, external: false, filesOk: true,
+    readme: '', readmePath: '', descText: '', manifestText: '',
     releases,
   };
 
-  if (!FULL_REFRESH && prev && prev.filesOk && prev.pushedAt && prev.pushedAt === repo.pushedAt
+  if (!FULL_REFRESH && prev && prev.v === BUNDLE_VERSION && prev.filesOk && prev.pushedAt && prev.pushedAt === repo.pushedAt
       && prev.ref === base.ref && !prev.external) {
-    Object.assign(bundle, { readme: prev.readme, descText: prev.descText, manifestText: prev.manifestText });
+    Object.assign(bundle, { readme: prev.readme, readmePath: prev.readmePath || '', descText: prev.descText, manifestText: prev.manifestText });
     return bundle;
   }
 
   let ok = true;
   const readme = await fetchReadme(base, target.path, (repo.trees || {})[target.id]);
   bundle.readme = readme.text;
+  bundle.readmePath = readme.path;
   ok = ok && readme.ok;
 
   // README can point at a separate description file, and either file can name the manifest
@@ -194,6 +235,8 @@ async function buildBundle(target, repo, prev) {
     if (text === null) ok = false; else bundle.manifestText = text;
   }
 
+  if (ok && !bundle.readme) console.warn(`No README found for ${target.key}`);
+
   const own = `${RAW}/${target.owner}/${target.repo}/`.toLowerCase();
   bundle.external = [descLoc, manifestLoc].some((l) => l && !l.raw.toLowerCase().startsWith(own));
 
@@ -201,7 +244,7 @@ async function buildBundle(target, repo, prev) {
     // Do not let a failed download wipe out good data, and make sure the next run tries again
     bundle.filesOk = false;
     if (prev && prev.readme) {
-      Object.assign(bundle, { readme: prev.readme, descText: prev.descText, manifestText: prev.manifestText });
+      Object.assign(bundle, { readme: prev.readme, readmePath: prev.readmePath || '', descText: prev.descText, manifestText: prev.manifestText });
       console.warn(`Could not refresh files for ${target.key}; kept the previous ones, will retry next run`);
     } else {
       console.warn(`Could not download all files for ${target.key}; will retry next run`);
