@@ -81,19 +81,46 @@
     } catch { return ''; }
   }
 
+  // GitHub's own README lookup (checks .github/ and docs/ too), one request, used only as a last resort
+  async function fetchReadmeApi(base, folder) {
+    const dir = folder ? '/' + folder.split('/').map(encodeURIComponent).join('/') : '';
+    try {
+      const res = await fetch(`https://api.github.com/repos/${base.owner}/${base.repo}/readme${dir}?ref=${encodeURIComponent(base.ref)}`);
+      if (!res.ok) return { text: '', path: '' };
+      const j = await res.json();
+      let text = '';
+      if (j.encoding === 'base64' && j.content) {
+        const bin = atob(j.content.replace(/\s/g, ''));
+        text = new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+      } else if (j.download_url) {
+        text = await fetchText(j.download_url);
+      }
+      return { text, path: j.path || '' };
+    } catch { return { text: '', path: '' }; }
+  }
+
+  // { text, path }: the README and where it was found
   async function fetchReadme(base, folder) {
     const prefix = folder ? folder + '/' : '';
     for (const name of ['README.md', 'readme.md', 'Readme.md', 'README.markdown', 'README']) {
       const text = await fetchText(makeLoc(base.owner, base.repo, base.ref, prefix + name).raw);
-      if (text) return text;
+      if (text) return { text, path: prefix + name };
     }
-    return '';
+    if (!folder) {
+      for (const path of ['docs/README.md', 'docs/readme.md', '.github/README.md']) {
+        const text = await fetchText(makeLoc(base.owner, base.repo, base.ref, path).raw);
+        if (text) return { text, path };
+      }
+    }
+    return fetchReadmeApi(base, folder);
   }
 
   // Downloads the README, the description file it may point to, and the manifest into the bundle
   async function fillFiles(bundle) {
     const base = { owner: bundle.owner, repo: bundle.repo, ref: bundle.ref };
-    bundle.readme = await fetchReadme(base, bundle.path);
+    const readme = await fetchReadme(base, bundle.path);
+    bundle.readme = readme.text;
+    bundle.readmePath = readme.path;
     let bodies = extractBlocks(bundle.readme).blocks;
     const descLoc = locate(parseInfo(bodies).modDescription, base);
     if (descLoc) {
