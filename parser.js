@@ -260,7 +260,7 @@
   // site shows. Used by the site and by scripts/build-data.js, so both agree.
   function deriveMod(b, taxonomy) {
     const base = { owner: b.owner, repo: b.repo, ref: b.ref };
-    const readmeLoc = makeLoc(b.owner, b.repo, b.ref, (b.path ? b.path + '/' : '') + 'README.md');
+        const readmeLoc = makeLoc(b.owner, b.repo, b.ref, b.readmePath || ((b.path ? b.path + '/' : '') + 'README.md'));
 
     // Description: the README, or the file it redirects to
     const rm = extractBlocks(b.readme);
