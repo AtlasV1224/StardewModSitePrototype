@@ -28,7 +28,7 @@ const RELEASES = 5;          // releases kept per mod
 const FILE_CONCURRENCY = 4;  // simultaneous raw file downloads (kept low: raw.githubusercontent.com rate limits bursts)
 const BACKOFF_MS = Number(process.env.BACKOFF_MS || 2000);
 // Bump this when the way files are found or stored changes: older saved files are then downloaded again once
-const BUNDLE_VERSION = 2;
+const BUNDLE_VERSION = 3;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -118,6 +118,30 @@ function readmeNames(entries) {
       const rank = (n) => { const i = README_EXT.indexOf((n.split('.')[1] || '').toLowerCase()); return i < 0 ? 99 : i; };
       return rank(a) - rank(b);
     });
+}
+
+// GitHub's own README lookup: it also checks .github/ and docs/ and accepts any name or extension.
+// Returns { text, path }, with text '' when there is none, or null if GitHub kept refusing.
+async function fetchReadmeViaApi(base, folder) {
+  const dir = folder ? '/' + folder.split('/').map(encodeURIComponent).join('/') : '';
+  const ref = base.ref && base.ref !== 'HEAD' ? `?ref=${encodeURIComponent(base.ref)}` : '';
+  const url = `https://api.github.com/repos/${base.owner}/${base.repo}/readme${dir}${ref}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'stardew-modsite-data' },
+      });
+      if (res.status === 404) return { text: '', path: '' };
+      if (res.ok) {
+        const j = await res.json();
+        let text = j.encoding === 'base64' && j.content ? Buffer.from(j.content, 'base64').toString('utf8') : '';
+        if (!text && j.download_url) text = (await fetchText(j.download_url)) || '';
+        return { text, path: j.path || '' };
+      }
+    } catch {}
+    await sleep(attempt * BACKOFF_MS);
+  }
+  return null;
 }
 
 // GitHub's own README lookup: it also checks .github/ and docs/ and accepts any name or extension.
