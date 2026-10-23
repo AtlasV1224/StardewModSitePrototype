@@ -182,6 +182,17 @@
     } catch { return href; }
   }
 
+  // If an image is missing on the branch used, try the repository's default branch (HEAD) once.
+  // With remove set, an image that still fails is removed.
+  function retryOnDefaultBranch(img, remove) {
+    img.addEventListener('error', () => {
+      const m = /^(https:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/)(?!HEAD\/)[^/]+\/(.+)$/.exec(img.getAttribute('src') || '');
+      if (m && !img.dataset.retried) { img.dataset.retried = '1'; img.src = m[1] + 'HEAD/' + m[2]; }
+      else if (remove) img.remove();
+    });
+  }
+
+
   // Returns a sanitised fragment for markdown located at loc, with images and links made absolute
   function renderMarkdown(md, loc) {
     const html = DOMPurify.sanitize(marked.parse(md || '', { gfm: true }));
@@ -194,6 +205,7 @@
       img.setAttribute('src', resolveImage(img.getAttribute('src') || '', loc));
       img.removeAttribute('srcset');
       img.setAttribute('loading', 'lazy');
+      retryOnDefaultBranch(img);
     });
     root.querySelectorAll('a[href]').forEach((a) => {
       const href = a.getAttribute('href');
@@ -307,7 +319,7 @@
 
   function fillCard(card, mod) {
     const img = el('img', { src: mod.thumb, alt: '', loading: 'lazy' });
-    img.addEventListener('error', () => img.remove());
+    retryOnDefaultBranch(img, true);
     const next = el('a', { class: 'card', href: '#' + mod.id },
       el('div', { class: 'thumb' }, img),
       el('div', { class: 'body' },
@@ -529,7 +541,7 @@
       const gallery = el('div', { class: 'gallery' });
       mod.images.forEach((src) => {
         const img = el('img', { src, alt: '', loading: 'lazy' });
-        img.addEventListener('error', () => img.remove());
+        retryOnDefaultBranch(img, true);
         img.addEventListener('click', () => openLightbox(src));
         gallery.append(img);
       });
